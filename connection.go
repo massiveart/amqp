@@ -17,19 +17,44 @@ import (
 	"time"
 )
 
-// Config is used in Open to specify the desired tuning parameters used during
-// a connection open handshake.  The negotiated tuning will be stored in the
-// returned connection's Config field.
+const defaultHeartbeat = 10 * time.Second
+const defaultConnectionTimeout = 30 * time.Second
+const defaultProduct = "https://github.com/streadway/amqp"
+const defaultVersion = "β"
+
+// Config is used in DialConfig and Open to specify the desired tuning
+// parameters used during a connection open handshake.  The negotiated tuning
+// will be stored in the returned connection's Config field.
 type Config struct {
 	// The SASL mechanisms to try in the client request, and the successful
-	// mechanism used on the Connection object
+	// mechanism used on the Connection object.
+	// If SASL is nil, PlainAuth from the URL is used.
 	SASL []Authentication
 
+	// Vhost specifies the namespace of permissions, exchanges, queues and
+	// bindings on the server.  Dial sets this to the path parsed from the URL.
 	Vhost string
 
 	Channels  int           // 0 max channels means unlimited
 	FrameSize int           // 0 max bytes means unlimited
-	Heartbeat time.Duration // less than 1s interval means no heartbeats
+	Heartbeat time.Duration // less than 1s uses the server's interval
+
+	// TLSClientConfig specifies the client configuration of the TLS connection
+	// when establishing a tls transport.
+	// If the URL uses an amqps scheme, then an empty tls.Config with the
+	// ServerName from the URL is used.
+	TLSClientConfig *tls.Config
+
+	// Properties is table of properties that the client advertises to the server.
+	// This is an optional setting - if the application does not set this,
+	// the underlying library will use a generic set of client properties.
+	Properties Table
+
+	// Dial returns a net.Conn prepared for a TLS handshake with TSLClientConfig,
+	// then an AMQP connection handshake.
+	// If Dial is nil, net.DialTimeout with a 30s connection and 30s read
+	// deadline is used.
+	Dial func(network, addr string) (net.Conn, error)
 }
 
 // Connection manages the serialization and deserialization of frames from IO
@@ -53,6 +78,7 @@ type Connection struct {
 
 	noNotify bool // true when we will never notify again
 	closes   []chan *Error
+	blocks   []chan Blocking
 
 	errors chan *Error
 
@@ -67,6 +93,25 @@ type readDeadliner interface {
 	SetReadDeadline(time.Time) error
 }
 
+type localNetAddr interface {
+	LocalAddr() net.Addr
+}
+
+// defaultDial establishes a connection when config.Dial is not provided
+func defaultDial(network, addr string) (net.Conn, error) {
+	conn, err := net.DialTimeout(network, addr, defaultConnectionTimeout)
+	if err != nil {
+		return nil, err
+	}
+
+	// Heartbeating hasn't started yet, don't stall forever on a dead server.
+	if err := conn.SetReadDeadline(time.Now().Add(defaultConnectionTimeout)); err != nil {
+		return nil, err
+	}
+
+	return conn, nil
+}
+
 // Dial accepts a string in the AMQP URI format and returns a new Connection
 // over TCP using PlainAuth.  Defaults to a server heartbeat interval of 10
 // seconds and sets the initial read deadline to 30 seconds.
@@ -74,7 +119,9 @@ type readDeadliner interface {
 // Dial uses the zero value of tls.Config when it encounters an amqps://
 // scheme.  It is equivalent to calling DialTLS(amqp, nil).
 func Dial(url string) (*Connection, error) {
-	return DialTLS(url, nil)
+	return DialConfig(url, Config{
+		Heartbeat: defaultHeartbeat,
+	})
 }
 
 // DialTLS accepts a string in the AMQP URI format and returns a new Connection
@@ -83,6 +130,17 @@ func Dial(url string) (*Connection, error) {
 //
 // DialTLS uses the provided tls.Config when encountering an amqps:// scheme.
 func DialTLS(url string, amqps *tls.Config) (*Connection, error) {
+	return DialConfig(url, Config{
+		Heartbeat:       defaultHeartbeat,
+		TLSClientConfig: amqps,
+	})
+}
+
+// DialConfig accepts a string in the AMQP URI format and a configuration for
+// the transport and connection setup, returning a new Connection.  Defaults to
+// a server heartbeat interval of 10 seconds and sets the initial read deadline
+// to 30 seconds.
+func DialConfig(url string, config Config) (*Connection, error) {
 	var err error
 	var conn net.Conn
 
@@ -91,35 +149,41 @@ func DialTLS(url string, amqps *tls.Config) (*Connection, error) {
 		return nil, err
 	}
 
+	if config.SASL == nil {
+		config.SASL = []Authentication{uri.PlainAuth()}
+	}
+
+	if config.Vhost == "" {
+		config.Vhost = uri.Vhost
+	}
+
+	if uri.Scheme == "amqps" && config.TLSClientConfig == nil {
+		config.TLSClientConfig = new(tls.Config)
+	}
+
 	addr := net.JoinHostPort(uri.Host, strconv.FormatInt(int64(uri.Port), 10))
 
-	conn, err = net.DialTimeout("tcp", addr, 30*time.Second)
+	dialer := config.Dial
+	if dialer == nil {
+		dialer = defaultDial
+	}
+
+	conn, err = dialer("tcp", addr)
 	if err != nil {
 		return nil, err
 	}
 
-	// Heartbeating hasn't started yet, don't stall forever on a dead server.
-	if err := conn.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
-		return nil, err
-	}
-
-	// amqps schemes get a client TLS encapulation.  With the dial and heartbeat
-	// timeouts so that TLS tunnels don't establish a tunnel to a dead server.
-	if uri.Scheme == "amqps" {
-		if amqps == nil {
-			amqps = new(tls.Config)
-		}
-
+	if config.TLSClientConfig != nil {
 		// Use the URI's host for hostname validation unless otherwise set. Make a
 		// copy so not to modify the caller's reference when the caller reuses a
 		// tls.Config for a different URL.
-		if amqps.ServerName == "" {
-			c := *amqps
+		if config.TLSClientConfig.ServerName == "" {
+			c := *config.TLSClientConfig
 			c.ServerName = uri.Host
-			amqps = &c
+			config.TLSClientConfig = &c
 		}
 
-		client := tls.Client(conn, amqps)
+		client := tls.Client(conn, config.TLSClientConfig)
 		if err := client.Handshake(); err != nil {
 			conn.Close()
 			return nil, err
@@ -128,11 +192,7 @@ func DialTLS(url string, amqps *tls.Config) (*Connection, error) {
 		conn = client
 	}
 
-	return Open(conn, Config{
-		SASL:      []Authentication{uri.PlainAuth()},
-		Vhost:     uri.Vhost,
-		Heartbeat: 10 * time.Second,
-	})
+	return Open(conn, config)
 }
 
 /*
@@ -156,6 +216,17 @@ func Open(conn io.ReadWriteCloser, config Config) (*Connection, error) {
 }
 
 /*
+LocalAddr returns the local TCP peer address, or ":0" (the zero value of net.TCPAddr)
+as a fallback default value if the underlying transport does not support LocalAddr().
+*/
+func (me *Connection) LocalAddr() net.Addr {
+	if c, ok := me.conn.(localNetAddr); ok {
+		return c.LocalAddr()
+	}
+	return &net.TCPAddr{}
+}
+
+/*
 NotifyClose registers a listener for close events either initiated by an error
 accompaning a connection.close method or by a normal shutdown.
 
@@ -173,6 +244,30 @@ func (me *Connection) NotifyClose(c chan *Error) chan *Error {
 		close(c)
 	} else {
 		me.closes = append(me.closes, c)
+	}
+
+	return c
+}
+
+/*
+NotifyBlock registers a listener for RabbitMQ specific TCP flow control method
+extensions connection.blocked and connection.unblocked.  Flow control is active
+with a reason when Blocking.Blocked is true.  When a Connection is blocked, all
+methods will block across all connections until server resources become free
+again.
+
+This optional extension is supported by the server when the
+"connection.blocked" server capability key is true.
+
+*/
+func (me *Connection) NotifyBlocked(c chan Blocking) chan Blocking {
+	me.m.Lock()
+	defer me.m.Unlock()
+
+	if me.noNotify {
+		close(c)
+	} else {
+		me.blocks = append(me.blocks, c)
 	}
 
 	return c
@@ -220,7 +315,7 @@ func (me *Connection) send(f frame) error {
 
 	if err != nil {
 		// shutdown could be re-entrant from signaling notify chans
-		me.shutdown(&Error{
+		go me.shutdown(&Error{
 			Code:   FrameError,
 			Reason: err.Error(),
 		})
@@ -262,6 +357,10 @@ func (me *Connection) shutdown(err *Error) {
 			close(c)
 		}
 
+		for _, c := range me.blocks {
+			close(c)
+		}
+
 		me.noNotify = true
 	})
 }
@@ -288,6 +387,14 @@ func (me *Connection) dispatch0(f frame) {
 			})
 
 			me.shutdown(newError(m.ReplyCode, m.ReplyText))
+		case *connectionBlocked:
+			for _, c := range me.blocks {
+				c <- Blocking{Active: true, Reason: m.Reason}
+			}
+		case *connectionUnblocked:
+			for _, c := range me.blocks {
+				c <- Blocking{Active: false}
+			}
 		default:
 			me.rpc <- m
 		}
@@ -409,18 +516,9 @@ func (me *Connection) heartbeater(interval time.Duration, done chan *Error) {
 // Table for server identified capabilities like "basic.ack" or
 // "confirm.select".
 func (me *Connection) isCapable(featureName string) bool {
-	if me.Properties != nil {
-		if v, ok := me.Properties["capabilities"]; ok {
-			if capabilities, ok := v.(Table); ok {
-				if feature, ok := capabilities[featureName]; ok {
-					if has, ok := feature.(bool); ok && has {
-						return true
-					}
-				}
-			}
-		}
-	}
-	return false
+	capabilities, _ := me.Properties["capabilities"].(Table)
+	hasFeature, _ := capabilities[featureName].(bool)
+	return hasFeature
 }
 
 /*
@@ -509,9 +607,22 @@ func (me *Connection) openStart(config Config) error {
 }
 
 func (me *Connection) openTune(config Config, auth Authentication) error {
+	if len(config.Properties) == 0 {
+		config.Properties = Table{
+			"product": defaultProduct,
+			"version": defaultVersion,
+		}
+	}
+
+	config.Properties["capabilities"] = Table{
+		"connection.blocked":     true,
+		"consumer_cancel_notify": true,
+	}
+
 	ok := &connectionStartOk{
-		Mechanism: auth.Mechanism(),
-		Response:  auth.Response(),
+		Mechanism:        auth.Mechanism(),
+		Response:         auth.Response(),
+		ClientProperties: config.Properties,
 	}
 	tune := &connectionTune{}
 

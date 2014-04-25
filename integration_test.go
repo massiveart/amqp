@@ -15,8 +15,10 @@ import (
 	"hash/crc32"
 	"io"
 	"math/rand"
+	"net"
 	"os"
 	"reflect"
+	"strconv"
 	"testing"
 	"testing/quick"
 	"time"
@@ -39,6 +41,137 @@ func TestIntegrationOpenCloseChannel(t *testing.T) {
 		if _, err := c.Channel(); err != nil {
 			t.Errorf("Channel could not be opened: %s", err)
 		}
+	}
+}
+
+func TestIntegrationOpenConfig(t *testing.T) {
+	config := Config{}
+
+	c, err := DialConfig(integrationURLFromEnv(), config)
+	if err != nil {
+		t.Errorf("expected to dial with config %+v integration server: %s", config, err)
+	}
+
+	if _, err := c.Channel(); err != nil {
+		t.Fatalf("expected to open channel: %s", err)
+	}
+
+	if err := c.Close(); err != nil {
+		t.Fatalf("connection close: %s", err)
+	}
+}
+
+func TestIntegrationOpenConfigWithNetDial(t *testing.T) {
+	config := Config{Dial: net.Dial}
+
+	c, err := DialConfig(integrationURLFromEnv(), config)
+	if err != nil {
+		t.Errorf("expected to dial with config %+v integration server: %s", config, err)
+	}
+
+	if _, err := c.Channel(); err != nil {
+		t.Fatalf("expected to open channel: %s", err)
+	}
+
+	if err := c.Close(); err != nil {
+		t.Fatalf("connection close: %s", err)
+	}
+}
+
+func TestIntegrationLocalAddr(t *testing.T) {
+	config := Config{}
+
+	c, err := DialConfig(integrationURLFromEnv(), config)
+	defer c.Close()
+	if err != nil {
+		t.Errorf("expected to dial with config %+v integration server: %s", config, err)
+	}
+
+	a := c.LocalAddr()
+	_, portString, err := net.SplitHostPort(a.String())
+	if err != nil {
+		t.Errorf("expected to get a local network address with config %+v integration server: %s", config, a.String())
+	}
+
+	port, err := strconv.Atoi(portString)
+	if err != nil {
+		t.Errorf("expected to get a TCP port number with config %+v integration server: %s", config, err)
+	}
+	t.Logf("Connected to port %d\n", port)
+}
+
+// https://github.com/streadway/amqp/issues/94
+func TestIntegrationExchangePassive(t *testing.T) {
+	c := integrationConnection(t, "exch")
+	if c != nil {
+		defer c.Close()
+
+		/*
+			this channel will close when we purposely trigger an error
+			with ExchangeDeclarePassive
+		*/
+		channel1, err := c.Channel()
+		if err != nil {
+			t.Fatalf("create channel1: %s", err)
+		}
+		t.Logf("create channel1 OK")
+
+		exchange := "test-integration-passive-exchange"
+
+		if err := channel1.ExchangeDeclarePassive(
+			exchange, // name
+			"direct", // type
+			false,    // duration (note: is durable)
+			true,     // auto-delete
+			false,    // internal
+			false,    // nowait
+			nil,      // args
+		); err == nil {
+			t.Fatal("exchange declare passive should have non-nil error")
+		}
+		t.Logf("declare exchange passive OK")
+
+		channel2, err := c.Channel()
+		if err != nil {
+			t.Fatalf("create channel2: %s", err)
+		}
+		t.Logf("create channel2 OK")
+
+		if err := channel2.ExchangeDeclare(
+			exchange, // name
+			"direct", // type
+			false,    // duration
+			true,     // auto-delete
+			false,    // internal
+			false,    // nowait
+			nil,      // args
+		); err != nil {
+			t.Fatalf("declare exchange: %s", err)
+		}
+		t.Logf("declare exchange OK")
+
+		if err := channel2.ExchangeDeclarePassive(
+			exchange, // name
+			"direct", // type
+			false,    // duration (note: is durable)
+			true,     // auto-delete
+			false,    // internal
+			false,    // nowait
+			nil,      // args
+		); err != nil {
+			t.Fatalf("exchange declare passive %s", err)
+		}
+		t.Logf("declare exchange passive OK")
+
+		if err := channel2.ExchangeDelete(exchange, false, false); err != nil {
+			t.Fatalf("delete exchange: %s", err)
+		}
+		t.Logf("delete exchange OK")
+
+		if err := channel2.Close(); err != nil {
+			t.Fatalf("close channel: %s", err)
+		}
+		t.Logf("close channel OK")
 	}
 }
 
@@ -77,6 +210,83 @@ func TestIntegrationExchange(t *testing.T) {
 			t.Fatalf("close channel: %s", err)
 		}
 		t.Logf("close channel OK")
+	}
+}
+
+// https://github.com/streadway/amqp/issues/94
+func TestIntegrationPassiveQueue(t *testing.T) {
+	c := integrationConnection(t, "queue")
+	if c != nil {
+		defer c.Close()
+
+		channel1, err := c.Channel()
+		if err != nil {
+			t.Fatalf("create channel1: %s", err)
+		}
+		t.Logf("create channel1 OK")
+
+		exchangeName := "test-passive-queue-exchange"
+		queueName := "test-passive-queue"
+
+		if err := channel1.ExchangeDeclare(
+			exchangeName, // name
+			"direct",     // type
+			true,         // duration (note: is durable)
+			false,        // auto-delete
+			false,        // internal
+			false,        // nowait
+			nil,          // args
+		); err != nil {
+			t.Fatalf("declare exchange: %s", err)
+		}
+		t.Logf("declare exchange OK")
+
+		if _, err := channel1.QueueDeclarePassive(
+			queueName, // name
+			true,      // duration (note: durable)
+			false,     // auto-delete
+			false,     // exclusive
+			false,     // noWait
+			nil,       // arguments
+		); err == nil {
+			t.Fatal("queue declare passive should have non-nil error")
+		}
+		t.Logf("declare passive queue OK")
+
+		channel2, err := c.Channel()
+		if err != nil {
+			t.Fatalf("create channel2: %s", err)
+		}
+		t.Logf("create channel2 OK")
+
+		if _, err := channel2.QueueDeclare(
+			queueName, // name
+			true,      // duration (note: durable)
+			false,     // auto-delete
+			false,     // exclusive
+			false,     // noWait
+			nil,       // arguments
+		); err != nil {
+			t.Fatalf("queue declare: %s", err)
+		}
+		t.Logf("declare queue OK")
+
+		if _, err := channel2.QueueDeclarePassive(
+			queueName, // name
+			true,      // duration (note: durable)
+			false,     // auto-delete
+			false,     // exclusive
+			false,     // noWait
+			nil,       // arguments
+		); err != nil {
+			t.Fatalf("queue declare passive: %s", err)
+		}
+		t.Logf("declare passive queue OK")
+
+		if err := channel2.Close(); err != nil {
+			t.Fatalf("close channel2: %s", err)
+		}
+		t.Logf("close channel2 OK")
 	}
 }
 
@@ -865,6 +1075,35 @@ func TestIntegrationReturn(t *testing.T) {
 	}
 }
 
+func TestIntegrationCancel(t *testing.T) {
+	queue := "cancel"
+	consumerTag := "test.cancel"
+
+	if c, ch := integrationQueue(t, queue); c != nil {
+		defer c.Close()
+
+		cancels := ch.NotifyCancel(make(chan string, 1))
+
+		go func() {
+			if _, err := ch.Consume(queue, consumerTag, false, false, false, false, nil); err != nil {
+				t.Fatalf("cannot consume from %q to test NotifyCancel: %v", queue, err)
+			}
+			if _, err := ch.QueueDelete(queue, false, false, false); err != nil {
+				t.Fatalf("cannot delete integration queue: %v", err)
+			}
+		}()
+
+		select {
+		case tag := <-cancels:
+			if want, got := consumerTag, tag; want != got {
+				t.Fatalf("expected to be notified of deleted queue with consumer tag, got: %q", got)
+			}
+		case <-time.After(200 * time.Millisecond):
+			t.Fatalf("expected to be notified of deleted queue with 200ms")
+		}
+	}
+}
+
 func TestIntegrationConfirm(t *testing.T) {
 	if c, ch := integrationQueue(t, "confirm"); c != nil {
 		defer c.Close()
@@ -886,6 +1125,75 @@ func TestIntegrationConfirm(t *testing.T) {
 			}
 		case <-time.After(200 * time.Millisecond):
 			t.Fatalf("no ack was received within 200ms")
+		}
+	}
+}
+
+// https://github.com/streadway/amqp/issues/61
+func TestRoundTripAllFieldValueTypes61(t *testing.T) {
+	if conn := integrationConnection(t, "issue61"); conn != nil {
+		defer conn.Close()
+		timestamp := time.Unix(100000000, 0)
+
+		headers := Table{
+			"A": []interface{}{
+				[]interface{}{"nested array", int32(3)},
+				Decimal{2, 1},
+				Table{"S": "nested table in array"},
+				int32(2 << 20),
+				string("array string"),
+				timestamp,
+				nil,
+				byte(2),
+				float64(2.64),
+				float32(2.32),
+				int64(2 << 60),
+				int16(2 << 10),
+				bool(true),
+				[]byte{'b', '2'},
+			},
+			"D": Decimal{1, 1},
+			"F": Table{"S": "nested table in table"},
+			"I": int32(1 << 20),
+			"S": string("string"),
+			"T": timestamp,
+			"V": nil,
+			"b": byte(1),
+			"d": float64(1.64),
+			"f": float32(1.32),
+			"l": int64(1 << 60),
+			"s": int16(1 << 10),
+			"t": bool(true),
+			"x": []byte{'b', '1'},
+		}
+
+		queue := "test.issue61-roundtrip"
+		ch, _ := conn.Channel()
+
+		if _, err := ch.QueueDeclare(queue, false, true, false, false, nil); err != nil {
+			t.Fatalf("Could not declare")
+		}
+
+		msgs, err := ch.Consume(queue, "", false, false, false, false, nil)
+		if err != nil {
+			t.Fatalf("Could not consume")
+		}
+
+		err = ch.Publish("", queue, false, false, Publishing{Body: []byte("ignored"), Headers: headers})
+		if err != nil {
+			t.Fatalf("Could not publish: %v", err)
+		}
+
+		msg, ok := <-msgs
+
+		if !ok {
+			t.Fatalf("Channel closed prematurely likely due to publish exception")
+		}
+
+		for k, v := range headers {
+			if !reflect.DeepEqual(v, msg.Headers[k]) {
+				t.Errorf("Round trip header not the same for key %q: expected: %#v, got %#v", k, v, msg.Headers[k])
+			}
 		}
 	}
 }
@@ -1327,25 +1635,30 @@ func TestRabbitMQQueueNackMultipleRequeue(t *testing.T) {
  * Support for integration tests
  */
 
-// Returns a conneciton to the AMQP if the AMQP_URL environment
-// variable is set and a connnection can be established.
-func integrationConnection(t *testing.T, name string) *Connection {
+func integrationURLFromEnv() string {
 	url := os.Getenv("AMQP_URL")
 	if url == "" {
 		url = "amqp://"
 	}
+	return url
+}
 
-	conn, err := Dial(url)
-	if err != nil {
-		t.Errorf("Failed to connect to integration server: %s", err)
-		return nil
-	}
-
+func loggedConnection(t *testing.T, conn *Connection, name string) *Connection {
 	if name != "" {
 		conn.conn = &logIO{t, name, conn.conn}
 	}
-
 	return conn
+}
+
+// Returns a conneciton to the AMQP if the AMQP_URL environment
+// variable is set and a connnection can be established.
+func integrationConnection(t *testing.T, name string) *Connection {
+	conn, err := Dial(integrationURLFromEnv())
+	if err != nil {
+		t.Errorf("dial integration server: %s", err)
+		return nil
+	}
+	return loggedConnection(t, conn, name)
 }
 
 // Returns a connection, channel and delcares a queue when the AMQP_URL is in the environment

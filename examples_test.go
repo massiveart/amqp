@@ -6,9 +6,23 @@ import (
 	"github.com/streadway/amqp"
 	"io/ioutil"
 	"log"
+	"net"
 	"runtime"
 	"time"
 )
+
+func ExampleConfig_timeout() {
+	// Provide your own anonymous Dial function that delgates to net.DialTimout
+	// for custom timeouts
+
+	conn, err := amqp.DialConfig("amqp:///", amqp.Config{
+		Dial: func(network, addr string) (net.Conn, error) {
+			return net.DialTimeout(network, addr, 2*time.Second)
+		},
+	})
+
+	log.Printf("conn: %v, err: %v", conn, err)
+}
 
 func ExampleDialTLS() {
 	// To get started with SSL/TLS follow the instructions for adding SSL/TLS
@@ -347,4 +361,35 @@ func ExampleChannel_Publish() {
 		// is reset or if the server has run out of resources.
 		log.Fatalf("basic.publish: %v", err)
 	}
+}
+
+func publishAllTheThings(conn *amqp.Connection) {
+	// ... snarf snarf, barf barf
+}
+
+func ExampleConnection_NotifyBlocked() {
+	// Simply logs when the server throttles the TCP connection for publishers
+
+	// Test this by tuning your server to have a low memory watermark:
+	// rabbitmqctl set_vm_memory_high_watermark 0.00000001
+
+	conn, err := amqp.Dial("amqp://guest:guest@localhost:5672/")
+	if err != nil {
+		log.Fatalf("connection.open: %s", err)
+	}
+	defer conn.Close()
+
+	blockings := conn.NotifyBlocked(make(chan amqp.Blocking))
+	go func() {
+		for b := range blockings {
+			if b.Active {
+				log.Printf("TCP blocked: %q", b.Reason)
+			} else {
+				log.Printf("TCP unblocked")
+			}
+		}
+	}()
+
+	// Your application domain channel setup publishings
+	publishAllTheThings(conn)
 }

@@ -5,6 +5,8 @@
 // license that can be found in the LICENSE file.
 // Source code and contact info at http://github.com/streadway/amqp
 
+// +build ignore
+
 package main
 
 import (
@@ -171,7 +173,8 @@ var (
 	func isSoftExceptionCode(code int) bool {
 		switch code {
 		{{range $c := .Constants}} {{if $c.IsSoftError}} case {{$c.Value}}:
-		{{end}}{{end}}return true
+			return true
+		{{end}}{{end}}
 		}
 		return false
 	}
