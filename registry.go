@@ -39,6 +39,11 @@ func (m *channelRegistry) next() uint16 {
 	m.Lock()
 	defer m.Unlock()
 	m.sequence++
+
+	if m.sequence == 0 {
+		m.sequence = 1
+	}
+
 	return m.sequence
 }
 
